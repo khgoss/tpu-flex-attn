@@ -59,12 +59,11 @@ def tile_scans(q, k, v, mask):
         tile_row_max = jnp.max(weights, axis=-1, keepdims=True)
         row_max_update = jnp.maximum(tile_row_max, row_max)
 
-        # take exp with numerical stability
         # sum e^(x_i)*v_i / sum e(x_i)
         exp_weights = jnp.exp(weights - row_max_update)
         exp_weights = jnp.where(mask_tile, exp_weights, 0.)
 
-        # update date row sum
+        # update row sum
         tile_row_sum = jnp.sum(exp_weights, axis=-1, keepdims=True)
         exp_row_max_delta = jnp.exp(row_max - row_max_update)
         row_sum_update = exp_row_max_delta * row_sum + tile_row_sum
@@ -72,12 +71,11 @@ def tile_scans(q, k, v, mask):
         # weighted sum of values
         exp_vals = einsum('i ... j, j ... d -> i ... d', exp_weights, v_tile)
         
-        # update output -- rescale old numerator, add new update, normalize again
+        # rescale old numerator, add new update, normalize again
         result = exp_row_max_delta*row_sum/row_sum_update*result + exp_vals*(1.0/row_sum_update)
 
         return (result, row_sum_update, row_max_update), None
 
-    # running accumulators
     result = jnp.zeros((q_len, batch, heads, v_dim))
     row_sum = jnp.zeros((q_len, batch, heads, 1))
     row_max = jnp.ones((q_len, batch, heads, 1))*-1e6
@@ -92,7 +90,7 @@ def tile_scans(q, k, v, mask):
     row_sum = rearrange(row_sum, 'n ... 1 -> n ...')
     row_max = rearrange(row_max, 'n ... 1 -> n ...')
 
-    # compute LSE for backward pass
+    # need LSE for backward pass
     lse = jnp.log(row_sum) + row_max
     return result, lse
 
@@ -124,7 +122,7 @@ def flash_attn(q, k, v, mask):
         padding = k_len_padded - k_len
         k = jnp.pad(k, ((0, padding), (0, 0), (0, 0), (0, 0)), mode='constant')
         v = jnp.pad(v, ((0, padding), (0, 0), (0, 0), (0, 0)), mode='constant')
-        # mask padded positions as False (ie, don't attend)
+        # mask padded positions (ie, don't attend)
         mask = jnp.pad(mask, ((0, padding), (0, 0)), mode='constant', constant_values=False)
 
     # scan over q tiles, apply k tiles to each
@@ -155,9 +153,6 @@ def flash_attn(q, k, v, mask):
 # -------------- BACKWARD PASS -------------------------------
 # nb -- recomputing is faster than just storing the old vals
 def compute_p(q, k_tile, lse_tile, mask_tile):
-    """
-    rcompute attention probabilities -- P = softmax(QK^T / sqrt(d))
-    """
     scores = einsum('i b h d, j b h d -> i b h j', q, k_tile)
     scores = jnp.where(mask_tile, scores, MASK_VALUE)
     p = jnp.exp(scores - lse_tile)
@@ -200,7 +195,6 @@ def flash_attention_bckwd(res, dout):
         v = jnp.pad(v, ((0, pad_k), (0, 0), (0, 0), (0, 0)))
         mask = jnp.pad(mask, ((0, pad_k), (0, 0)), constant_values=False)
 
-    # gradient accumulators - init to 0
     dq = jnp.zeros_like(q)
     dk = jnp.zeros_like(k)
     dv = jnp.zeros_like(v)
@@ -245,11 +239,10 @@ def flash_attention_bckwd(res, dout):
             # compute dP
             dp = einsum('i b h d, j b h d -> i b h j', dout_tile, v_tile)
 
-            # apply delta correction to get dS
             # gradient wrt attention logits (pre-softmax)
             ds = p * scale * (dp - D)
 
-            # compute dQ -- accumulate results from all kv tiles
+            # get results from all kv tiles
             dq_tile_acc += einsum('i b h j, j b h d -> i b h d', ds, k_tile)
 
             # compute dK contribution for this kv tile
@@ -258,7 +251,7 @@ def flash_attention_bckwd(res, dout):
 
             return (dq_tile_acc, dk_tile, dv_tile), None
 
-        # init accumulators for this q tile
+        # init for this q tile
         dq_tile_init = jnp.zeros_like(q_tile)
         dk_tile_init = jnp.zeros_like(k)
         dv_tile_init = jnp.zeros_like(v)
@@ -271,7 +264,6 @@ def flash_attention_bckwd(res, dout):
             length=math.ceil(k_len_padded / K_TILE_SZ)
         )
 
-        # update global accumulators
         # nb: each q tile's gradient is independent, can write directly
         dq_acc = lax.dynamic_update_slice(dq_acc, dq_tile_final, (q_tile_idx, 0, 0, 0))
         dk_acc += dk_update
@@ -298,14 +290,6 @@ def flash_attention_bckwd(res, dout):
 
     return dq, dk, dv, None
 
-
-
-# register custom vjp 
-# "The @jax.custom_vjp decorator allows you to 
-# associate a function with custom forward and 
-# backward pass implementations for reverse-mode 
-# automatic differentiation."
-# see https://apxml.com/courses/advanced-jax/chapter-4-advanced-automatic-differentiation/custom-vjp-rules
 @custom_vjp
 @jit
 def flash_attention(q, k, v, mask):
